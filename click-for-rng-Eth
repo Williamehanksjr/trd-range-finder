@@ -1,0 +1,197 @@
+import requests
+from datetime import datetime, timedelta
+import ui
+import sound
+
+# ================= CONFIG =================
+INTERVAL = 5
+WINDOW_SECONDS = 15 * 60
+
+PRICE_TICK = 5
+NUM_TICKS = 20
+
+SYMBOL = "ETH-USD"
+COLOR = "yellow"
+
+# ================= STATE =================
+times = []
+prices = []
+
+alert_above = None
+alert_below = None
+last_price = None
+
+MARGIN_LEFT = 90
+MARGIN_BOTTOM = 50
+MARGIN_TOP = 40
+MARGIN_RIGHT = 20
+
+# ================= DATA =================
+def fetch_price():
+    url = f"https://api.exchange.coinbase.com/products/{SYMBOL}/ticker"
+    r = requests.get(url, timeout=5)
+    r.raise_for_status()
+    return float(r.json()["price"])
+
+# ================= VIEW =================
+class Chart(ui.View):
+    def draw(self):
+        if len(times) < 2:
+            return
+
+        w, h = self.width, self.height
+        plot_w = w - MARGIN_LEFT - MARGIN_RIGHT
+        plot_h = h - MARGIN_TOP - MARGIN_BOTTOM
+
+        start_t = times[0]
+        end_t = times[-1]
+        span_t = (end_t - start_t).total_seconds() or 1
+
+        current_price = prices[-1]
+
+        # ---- Fixed sliding Y-axis ----
+        half_range = (NUM_TICKS * PRICE_TICK) / 2
+        y_center = round(current_price / PRICE_TICK) * PRICE_TICK
+        y_min = y_center - half_range
+        y_max = y_center + half_range
+        span_p = y_max - y_min
+
+        # ---- Axes ----
+        ui.set_color('white')
+        axis = ui.Path()
+        axis.move_to(MARGIN_LEFT, MARGIN_TOP)
+        axis.line_to(MARGIN_LEFT, h - MARGIN_BOTTOM)
+        axis.line_to(w - MARGIN_RIGHT, h - MARGIN_BOTTOM)
+        axis.stroke()
+
+        # ---- Y-axis labels ----
+        p = y_min
+        while p <= y_max:
+            y = MARGIN_TOP + (1 - (p - y_min) / span_p) * plot_h
+            tick = ui.Path()
+            tick.move_to(MARGIN_LEFT - 6, y)
+            tick.line_to(MARGIN_LEFT, y)
+            tick.stroke()
+
+            ui.draw_string(
+                f"{p:,.0f}",
+                rect=(5, y - 10, MARGIN_LEFT - 10, 20),
+                color='white',
+                font=('Menlo', 12),
+                alignment=ui.ALIGN_RIGHT
+            )
+            p += PRICE_TICK
+
+        # ---- X-axis labels ----
+        for i in range(4):
+            x = MARGIN_LEFT + i * plot_w / 3
+            t = start_t + timedelta(seconds=i * span_t / 3)
+            ui.draw_string(
+                t.strftime("%H:%M"),
+                rect=(x - 30, h - MARGIN_BOTTOM + 5, 60, 20),
+                color='white',
+                font=('Menlo', 12),
+                alignment=ui.ALIGN_CENTER
+            )
+
+        # ---- Price line ----
+        path = ui.Path()
+        for i, p in enumerate(prices):
+            x = MARGIN_LEFT + ((times[i] - start_t).total_seconds() / span_t) * plot_w
+            y = MARGIN_TOP + (1 - (p - y_min) / span_p) * plot_h
+            if i == 0:
+                path.move_to(x, y)
+            else:
+                path.line_to(x, y)
+
+        ui.set_color(COLOR)
+        path.stroke()
+
+        # ---- Alert lines ----
+        if alert_above is not None:
+            ui.set_color('red')
+            y = MARGIN_TOP + (1 - (alert_above - y_min) / span_p) * plot_h
+            ui.Path.rect(MARGIN_LEFT, y, plot_w, 1).fill()
+
+        if alert_below is not None:
+            ui.set_color('orange')
+            y = MARGIN_TOP + (1 - (alert_below - y_min) / span_p) * plot_h
+            ui.Path.rect(MARGIN_LEFT, y, plot_w, 1).fill()
+
+        # ---- Title ----
+        ui.draw_string(
+            f"{SYMBOL}  ${current_price:,.2f}",
+            rect=(MARGIN_LEFT + 10, MARGIN_TOP - 30, 320, 24),
+            color='white',
+            font=('Menlo', 16)
+        )
+
+    # ---- Touch handling (single tap, position-based) ----
+    def touch_began(self, touch):
+        global alert_above, alert_below
+
+        if not prices:
+            return
+
+        _, y = touch.location
+        h = self.height
+        plot_h = h - MARGIN_TOP - MARGIN_BOTTOM
+
+        current_price = prices[-1]
+
+        half_range = (NUM_TICKS * PRICE_TICK) / 2
+        y_center = round(current_price / PRICE_TICK) * PRICE_TICK
+        y_min = y_center - half_range
+        y_max = y_center + half_range
+        span_p = y_max - y_min
+
+        tapped_price = y_min + (1 - (y - MARGIN_TOP) / plot_h) * span_p
+        tapped_price = round(tapped_price / PRICE_TICK) * PRICE_TICK
+
+        if tapped_price > current_price:
+            alert_above = tapped_price
+            print(f"🔔 Alert ABOVE set at {alert_above}")
+            sound.play_effect("arcade:Coin_1")
+        else:
+            alert_below = tapped_price
+            print(f"🔔 Alert BELOW set at {alert_below}")
+            sound.play_effect("arcade:Coin_1")
+
+        self.set_needs_display()
+
+# ================= RUN =================
+view = Chart()
+view.background_color = 'black'
+view.present('fullscreen')
+
+def update():
+    global last_price
+
+    try:
+        now = datetime.now()
+        price = fetch_price()
+
+        times.append(now)
+        prices.append(price)
+
+        if last_price is not None:
+            if alert_above is not None and last_price < alert_above <= price:
+                sound.play_effect("arcade:Powerup_1")
+            if alert_below is not None and last_price > alert_below >= price:
+                sound.play_effect("arcade:Explosion_2")
+
+        last_price = price
+
+        cutoff = now - timedelta(seconds=WINDOW_SECONDS)
+        while times and times[0] < cutoff:
+            times.pop(0)
+            prices.pop(0)
+
+        view.set_needs_display()
+
+    except Exception as e:
+        print("Error:", e)
+
+    ui.delay(update, INTERVAL)
+
+update()
