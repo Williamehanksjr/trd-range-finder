@@ -2,23 +2,21 @@ import requests
 from datetime import datetime, timedelta
 import ui
 import sound
+import math
 
 # ================= CONFIG =================
 INTERVAL = 5
 WINDOW_SECONDS = 15 * 60
 
-PRICE_TICK = 5
-NUM_TICKS = 20
-
-SYMBOL = "ETH-USD"
+SYMBOL = "ETH-USD"   # "BTC-USD", "/MCL", "MCL=F"
 COLOR = "yellow"
 
 # ================= STATE =================
 times = []
 prices = []
 
-alert_above = None
-alert_below = None
+alert_high = None
+alert_low = None
 last_price = None
 
 MARGIN_LEFT = 90
@@ -26,15 +24,67 @@ MARGIN_BOTTOM = 50
 MARGIN_TOP = 40
 MARGIN_RIGHT = 20
 
+
 # ================= DATA =================
+def normalize_symbol(symbol):
+    if symbol.startswith("/"):
+        return symbol[1:] + "=F"
+    return symbol
+
+
 def fetch_price():
-    url = f"https://api.exchange.coinbase.com/products/{SYMBOL}/ticker"
+    # Crypto via Coinbase
+    if "-USD" in SYMBOL:
+        url = f"https://api.exchange.coinbase.com/products/{SYMBOL}/ticker"
+        r = requests.get(url, timeout=5)
+        r.raise_for_status()
+        return float(r.json()["price"])
+
+    # Futures via Yahoo JSON
+    yf_symbol = normalize_symbol(SYMBOL)
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={yf_symbol}"
     r = requests.get(url, timeout=5)
     r.raise_for_status()
-    return float(r.json()["price"])
+    data = r.json()
+    return float(data["quoteResponse"]["result"][0]["regularMarketPrice"])
+
 
 # ================= VIEW =================
 class Chart(ui.View):
+
+    def _compute_y_range(self):
+        values = prices[:]
+        if alert_high is not None:
+            values.append(alert_high)
+        if alert_low is not None:
+            values.append(alert_low)
+
+        raw_min = min(values)
+        raw_max = max(values)
+
+        span = raw_max - raw_min
+        if span == 0:
+            span = abs(raw_max) * 0.01 or 1.0
+
+        # ---- Nice step calculation (1,2,5 x 10^n) ----
+        magnitude = 10 ** math.floor(math.log10(span))
+        residual = span / magnitude
+
+        if residual >= 5:
+            nice = 1 * magnitude
+        elif residual >= 2:
+            nice = 0.5 * magnitude
+        else:
+            nice = 0.2 * magnitude
+
+        step = nice / 2
+
+        y_min = math.floor(raw_min / step) * step
+        y_max = math.ceil(raw_max / step) * step
+
+        span_p = y_max - y_min
+        return y_min, y_max, span_p, step
+
     def draw(self):
         if len(times) < 2:
             return
@@ -45,16 +95,11 @@ class Chart(ui.View):
 
         start_t = times[0]
         end_t = times[-1]
-        span_t = (end_t - start_t).total_seconds() or 1
+        span_t = (end_t - start_t).total_seconds() or 1.0
 
         current_price = prices[-1]
 
-        # ---- Fixed sliding Y-axis ----
-        half_range = (NUM_TICKS * PRICE_TICK) / 2
-        y_center = round(current_price / PRICE_TICK) * PRICE_TICK
-        y_min = y_center - half_range
-        y_max = y_center + half_range
-        span_p = y_max - y_min
+        y_min, y_max, span_p, step = self._compute_y_range()
 
         # ---- Axes ----
         ui.set_color('white')
@@ -64,25 +109,21 @@ class Chart(ui.View):
         axis.line_to(w - MARGIN_RIGHT, h - MARGIN_BOTTOM)
         axis.stroke()
 
-        # ---- Y-axis labels ----
-        p = y_min
-        while p <= y_max:
+        # ---- Even Y labels ----
+        num_steps = int(round(span_p / step))
+        for i in range(num_steps + 1):
+            p = y_min + i * step
             y = MARGIN_TOP + (1 - (p - y_min) / span_p) * plot_h
-            tick = ui.Path()
-            tick.move_to(MARGIN_LEFT - 6, y)
-            tick.line_to(MARGIN_LEFT, y)
-            tick.stroke()
 
             ui.draw_string(
-                f"{p:,.0f}",
+                f"{p:,.2f}",
                 rect=(5, y - 10, MARGIN_LEFT - 10, 20),
                 color='white',
-                font=('Menlo', 12),
+                font=('Menlo', 11),
                 alignment=ui.ALIGN_RIGHT
             )
-            p += PRICE_TICK
 
-        # ---- X-axis labels ----
+        # ---- X labels ----
         for i in range(4):
             x = MARGIN_LEFT + i * plot_w / 3
             t = start_t + timedelta(seconds=i * span_t / 3)
@@ -98,7 +139,7 @@ class Chart(ui.View):
         path = ui.Path()
         for i, p in enumerate(prices):
             x = MARGIN_LEFT + ((times[i] - start_t).total_seconds() / span_t) * plot_w
-            y = MARGIN_TOP + (1 - (p - y_min) / span_p) * plot_h
+            y = MARGIN_TOP + (1.0 - (p - y_min) / span_p) * plot_h
             if i == 0:
                 path.move_to(x, y)
             else:
@@ -108,61 +149,69 @@ class Chart(ui.View):
         path.stroke()
 
         # ---- Alert lines ----
-        if alert_above is not None:
+        if alert_high is not None:
             ui.set_color('red')
-            y = MARGIN_TOP + (1 - (alert_above - y_min) / span_p) * plot_h
+            y = MARGIN_TOP + (1.0 - (alert_high - y_min) / span_p) * plot_h
             ui.Path.rect(MARGIN_LEFT, y, plot_w, 1).fill()
 
-        if alert_below is not None:
+        if alert_low is not None:
             ui.set_color('orange')
-            y = MARGIN_TOP + (1 - (alert_below - y_min) / span_p) * plot_h
+            y = MARGIN_TOP + (1.0 - (alert_low - y_min) / span_p) * plot_h
             ui.Path.rect(MARGIN_LEFT, y, plot_w, 1).fill()
 
         # ---- Title ----
         ui.draw_string(
             f"{SYMBOL}  ${current_price:,.2f}",
-            rect=(MARGIN_LEFT + 10, MARGIN_TOP - 30, 320, 24),
+            rect=(MARGIN_LEFT + 10, MARGIN_TOP - 30, 420, 24),
             color='white',
             font=('Menlo', 16)
         )
 
-    # ---- Touch handling (single tap, position-based) ----
+        ui.draw_string(
+            "Tap: set LOW (orange). Tap again: set HIGH (red).",
+            rect=(MARGIN_LEFT + 10, h - MARGIN_BOTTOM + 22, 520, 18),
+            color='white',
+            font=('Menlo', 10)
+        )
+
     def touch_began(self, touch):
-        global alert_above, alert_below
+        global alert_high, alert_low
 
         if not prices:
             return
 
-        _, y = touch.location
-        h = self.height
-        plot_h = h - MARGIN_TOP - MARGIN_BOTTOM
+        x, y = touch.location
 
-        current_price = prices[-1]
+        if x < MARGIN_LEFT or x > (self.width - MARGIN_RIGHT):
+            return
+        if y < MARGIN_TOP or y > (self.height - MARGIN_BOTTOM):
+            return
 
-        half_range = (NUM_TICKS * PRICE_TICK) / 2
-        y_center = round(current_price / PRICE_TICK) * PRICE_TICK
-        y_min = y_center - half_range
-        y_max = y_center + half_range
-        span_p = y_max - y_min
+        plot_h = self.height - MARGIN_TOP - MARGIN_BOTTOM
+        y_min, y_max, span_p, _ = self._compute_y_range()
 
-        tapped_price = y_min + (1 - (y - MARGIN_TOP) / plot_h) * span_p
-        tapped_price = round(tapped_price / PRICE_TICK) * PRICE_TICK
+        frac = (y - MARGIN_TOP) / plot_h
+        tapped_price = y_max - frac * span_p
 
-        if tapped_price > current_price:
-            alert_above = tapped_price
-            print(f"🔔 Alert ABOVE set at {alert_above}")
+        if alert_low is None:
+            alert_low = tapped_price
             sound.play_effect("arcade:Coin_1")
+        elif alert_high is None:
+            alert_high = tapped_price
+            sound.play_effect("arcade:Coin_2")
         else:
-            alert_below = tapped_price
-            print(f"🔔 Alert BELOW set at {alert_below}")
+            alert_low = tapped_price
+            alert_high = None
             sound.play_effect("arcade:Coin_1")
 
         self.set_needs_display()
+
 
 # ================= RUN =================
 view = Chart()
 view.background_color = 'black'
 view.present('fullscreen')
+
 
 def update():
     global last_price
@@ -175,9 +224,9 @@ def update():
         prices.append(price)
 
         if last_price is not None:
-            if alert_above is not None and last_price < alert_above <= price:
+            if alert_high is not None and last_price < alert_high <= price:
                 sound.play_effect("arcade:Powerup_1")
-            if alert_below is not None and last_price > alert_below >= price:
+            if alert_low is not None and last_price > alert_low >= price:
                 sound.play_effect("arcade:Explosion_2")
 
         last_price = price
@@ -193,5 +242,6 @@ def update():
         print("Error:", e)
 
     ui.delay(update, INTERVAL)
+
 
 update()
